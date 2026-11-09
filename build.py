@@ -8,13 +8,13 @@ os.makedirs(PACKAGES_DIR, exist_ok=True)
 
 control_content = """Package: com.hoaug.a12powerfix
 Name: A12 Power & Anti-Throttle Fix
-Version: 1.0.0
+Version: 1.1.0
 Architecture: iphoneos-arm64e
-Maintainer: hoaug <hoaug@antigravity>
+Maintainer: hoaug <hoaug@duck.com>
 Author: hoaug
 Section: System
 Priority: optional
-Description: Fixes 0x04000000 charging pause, resets KioskMode/battery health cache for A12 (XS Max) on iOS 18, and provides zero-throttle max performance with auto-bindfs.
+Description: Permanent fix for 0x04000000 charging pause, locks KioskMode to 0 (immutable), resets battery health cache, and provides zero-throttle max performance with auto-bindfs.
 Tag: role::hacker, purpose::extension
 """
 
@@ -58,8 +58,16 @@ if command -v mount_bindfs >/dev/null 2>&1; then
 fi
 
 # 4. Fix KioskMode & Battery Health cache in /private/var
-PREFS_DIR="/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences"
-if [ -d "$PREFS_DIR" ]; then
+PREFS_DIR=""
+for P in "/rootfs/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences" "/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences"; do
+    if [ -d "$P" ]; then
+        PREFS_DIR="$P"
+        break
+    fi
+done
+
+if [ -n "$PREFS_DIR" ]; then
+    chflags nouchg "$PREFS_DIR"/*.plist 2>/dev/null || true
     mkdir -p "$PREFS_DIR/backup"
     cp -n "$PREFS_DIR"/*.plist "$PREFS_DIR/backup/" 2>/dev/null || true
 
@@ -142,7 +150,28 @@ EOF
 
     chmod 0644 "$PREFS_DIR"/*.plist
     chown -R 0:0 "$PREFS_DIR"
+
+    # Make KioskMode & BatteryHealth immutable to prevent iOS daemons from re-enabling kiosk limits
+    chflags uchg "$PREFS_DIR/com.apple.batterydata.kioskmode.plist" 2>/dev/null || true
+    chflags uchg "$PREFS_DIR/com.apple.batteryhealthdata.plist" 2>/dev/null || true
 fi
+
+# 5. Disable useless background daemons that waste RAM and CPU
+DAEMONS="
+com.apple.modelcatalogd
+com.apple.intelligenceplatformd
+com.apple.homed
+com.apple.ThreadCommissionerService
+com.apple.triald
+com.apple.momentsd
+com.apple.inputanalyticsd
+com.apple.wifianalyticsd
+com.apple.audioanalyticsd
+com.apple.ReportCrash
+"
+for d in $DAEMONS; do
+    launchctl disable "system/$d" 2>/dev/null || true
+done
 
 rm -rf /private/var/mobile/Library/Logs/CrashReporter/* 2>/dev/null || true
 rm -f /private/var/preferences/SystemConfiguration/OSThermalStatus.plist 2>/dev/null || true
@@ -160,6 +189,12 @@ if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
         mount_bindfs -u "/System/Library/ThermalMonitor" 2>/dev/null || true
         mount_bindfs -s --del "/System/Library/ThermalMonitor" 2>/dev/null || true
     fi
+
+    for P in "/rootfs/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences" "/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences"; do
+        if [ -d "$P" ]; then
+            chflags nouchg "$P"/*.plist 2>/dev/null || true
+        fi
+    done
 fi
 exit 0
 """
@@ -234,7 +269,7 @@ data_files = [
     {'path': './Library/LaunchDaemons/com.nan.auto-bindfs.plist', 'content': launchdaemon_content.strip().encode('utf-8') + b'\n', 'mode': 0o644},
 ]
 
-out_deb = os.path.join(PACKAGES_DIR, 'com.hoaug.a12powerfix_1.0.0_iphoneos-arm64e.deb')
+out_deb = os.path.join(PACKAGES_DIR, 'com.hoaug.a12powerfix_1.1.0_iphoneos-arm64e.deb')
 create_deb(out_deb, control_files, data_files)
 print(f"[Build] Successfully created {out_deb}")
 
