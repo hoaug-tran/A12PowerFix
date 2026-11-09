@@ -1,129 +1,147 @@
-# A12PowerFix (A12 Power & Anti-Throttle Fix)
+# A12PowerFix
 
-**Comprehensive fix for the iOS 18 charging pause (`NotChargingReason = 0x04000000`), battery health/service caching, and thermal performance throttling on Apple A12 devices (iPhone XS Max, XS, XR).**
+Fixes the iOS 18 charging pause (`NotChargingReason = 0x04000000`) and removes thermal throttling on Apple A12 devices.
 
----
-
-## 📌 Background & Problems
-
-On Apple A12 devices (specifically iPhone XS Max `iPhone11,6`, iPhone XS `iPhone11,2`, and iPhone XR `iPhone11,8`) running iOS 18 (e.g., iOS 18.7.1):
-
-### 1. The Charging Pause Issue (`NotChargingReason = 0x04000000`)
-- **Symptoms:** When plugged into a USB-PD fast charger (e.g., Apple 20W USB-C adapter), the iPhone detects the charger, shows the charging icon, and draws ~90mA @ 9V to power the system logic board, but **fails to charge the battery cell** (`ChargingCurrent = 0 mA`).
-- **Cold Boot Anomaly:** The device charges normally for the first ~60 seconds after a full cold reboot, but then suddenly stops charging. A userspace reboot (`launchctl reboot userspace`) does not restore charging.
-- **Root Cause Discovered via Reverse Engineering:**
-  - `NotChargingReason = 67108864` (`0x04000000` / bit 26) corresponds to **`INHIBIT_INFLOW`** (cutting off AC inflow current to the battery charging circuit).
-  - In iOS 18, Apple introduced persistent battery data caching in `/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences/`.
-  - When an original battery degrades (e.g., health drops to 76%), iOS writes `Battery Service State = 5` into `com.apple.batteryhealthdata.plist`, and flags `KioskModeMode = 1` in `com.apple.batterydata.kioskmode.plist`.
-  - Even after replacing the battery with a high-capacity replacement (e.g., Deji 3806 mAh), **iOS 18 does not flush this persistent cache**.
-  - ~60 seconds after startup, `powerd` reads this cache, synchronizes `KioskModeMode = 1` to the SMC/PMU, and commands the hardware to engage `INHIBIT_INFLOW` (`0x04000000`), forcing `ChargingCurrent = 0`.
-
-### 2. Thermal Mitigation & Extreme Throttling
-- When Closed Loop Thermal Management (CLTM) or internal hotspot decision tables trip:
-  - `thermalMitigationLimits` sets `dtCharger: 0` (kills charging current).
-  - `dtCPU: 1` (CPU throttled to 1% Load Index).
-  - `dtGPU: 0` (GPU throttled to lowest state, severe frame drops in games).
-  - `backlightComponentControl` dims the screen brightness down to 50% or lower.
-- **Why killing `thermalmonitord` fails:** Disabling `thermalmonitord` stops watchdog heartbeats to the hardware SMC/PMU, which causes the SMC watchdog failsafe to cut charging as well.
+Compatible with iPhone XS, XS Max, and XR running iOS 18.x on RootHide Dopamine (`iphoneos-arm64e`).
 
 ---
 
-## 🚀 How A12PowerFix Solves It
+## Technical Context
 
-`A12PowerFix` implements a clean, robust, and permanent fix:
+### The 0x04000000 Charging Pause
 
-1. **Persistent KioskMode & Battery Cache Reset:**
-   - Clears `KioskModeMode = 1` ➔ resets to `0` (enabling inflow).
-   - Detects the current active battery serial dynamically from IOKit.
-   - Clears `Battery Service State = 5` ➔ resets to `0` (Normal, No Service).
-   - Updates `Maximum Capacity Percent` to `100%`.
-   - Clears `com.apple.thermalmonitor.agingcontroller.plist` mitigation state.
-   - *Note: Because these settings are saved in `/private/var`, the charging fix persists even when unjailbroken (Stock iOS)!*
+#### Symptom
+When connected to a USB-PD charger, the device negotiates power and indicates charging, but battery current remains at `0 mA` (`ChargingCurrent = 0`). The device charges for roughly 60 seconds after a cold boot before inflow is cut. Userspace reboots (`launchctl reboot userspace`) do not restore charging.
 
-2. **Zero-Throttle Thermal Overlay (Max Performance):**
-   - Keeps `thermalmonitord` alive so SMC/PMU watchdog heartbeats remain healthy.
-   - Overlays patched thermal profiles (`D331pAP-Info.plist`, `D331AP-Info.plist`, `D321AP-Info.plist`) over `/System/Library/ThermalMonitor/` using RootHide-compatible `mount_bindfs`.
-   - Sets all Load Indexes (`dtCharger`, `dtCPU`, `dtGPU`, `dtBacklight`, `dtThermalLevel`) to **`101`** (unrestricted 100% capacity) across `light`, `moderate`, `heavy`, and all 16 `DecisionTreeTable` hotspot tables.
-   - Eliminates screen dimming and low-battery contextual clamps.
-   - Automatically remounts on every boot via `com.nan.auto-bindfs` launchdaemon.
+#### Cause
+Reading SMC key `CHNC` reveals `NotChargingReason = 67108864` (`0x04000000`). Bit 26 maps to `INHIBIT_INFLOW`, which instructs the power management unit (PMU) to drop AC charging current to zero.
 
-3. **System Cleanup:**
-   - Clears accumulated `.ips` crash reports from `/var/mobile/Library/Logs/CrashReporter/`.
+On iOS 18, persistent battery state is stored at:
+`/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences/`
+
+When a battery degrades past Apple's service threshold, iOS sets:
+- `Battery Service State = 5` in `com.apple.batteryhealthdata.plist`
+- `KioskModeMode = 1` in `com.apple.batterydata.kioskmode.plist`
+- `MitigationState = 2` in `com.apple.thermalmonitor.agingcontroller.plist`
+
+Replacing the physical battery with a third-party or high-capacity cell does not automatically clear this persistent cache. Roughly 60 seconds after system boot, `powerd` reads these files and commits `KioskModeMode = 1` to the SMC, tripping `INHIBIT_INFLOW`.
+
+### Thermal Throttling
+
+Under stock thermal management (`thermalmonitord`), temperature thresholds trigger Closed Loop Thermal Management (CLTM) mitigation tables:
+- `dtCharger` reduced to `0`
+- `dtCPU` throttled to minimum load index
+- `dtGPU` throttled, causing frame drops
+- `dtBacklight` reduced to 50% or below
+
+Terminating or disabling `thermalmonitord` causes SMC watchdog heartbeats to fail, triggering hardware failsafes that also disable charging.
 
 ---
 
-## 📦 Tested Environment
-- **Device:** iPhone XS Max (`iPhone11,6` / `D331pAP`), iPhone XS (`iPhone11,2` / `D321AP`), iPhone XR (`iPhone11,8` / `D331AP`).
-- **OS Version:** iOS 18.0 - 18.7.1+.
-- **Jailbreak:** RootHide Dopamine 2.x / 3.x (`iphoneos-arm64e`).
-- **Chargers Verified:** Apple 20W USB-C PD Adapter, 30W/65W GaN USB-PD chargers.
+## Changes Applied
+
+1. **Persistent Battery Cache Reset**
+   - Sets `KioskModeMode = 0` in `com.apple.batterydata.kioskmode.plist`.
+   - Reads the active battery serial from IOKit dynamically.
+   - Sets `Battery Service State = 0` and `Maximum Capacity Percent = 100` in `com.apple.batteryhealthdata.plist`.
+   - Resets `MitigationState = 0` in `com.apple.thermalmonitor.agingcontroller.plist`.
+   - *Because `/private/var` is persistent across reboots, this charging fix remains active even in non-jailbroken state.*
+
+2. **Zero-Throttle Thermal Overlay**
+   - Retains `thermalmonitord` to preserve SMC/PMU watchdog heartbeats.
+   - Uses `mount_bindfs` with `com.apple.private.bindfs-allow` to mount patched plists (`D331pAP`, `D331AP`, `D321AP`) over `/System/Library/ThermalMonitor/`.
+   - Pins all thermal load indexes (`dtCharger`, `dtCPU`, `dtGPU`, `dtBacklight`) to `101` across all states and DecisionTreeTable entries.
+   - Registers `/Library/LaunchDaemons/com.nan.auto-bindfs.plist` to remount on every boot.
+
+3. **System Maintenance**
+   - Clears accumulated crash logs from `/var/mobile/Library/Logs/CrashReporter/`.
 
 ---
 
-## 📥 Installation
+## Supported Devices
 
-Download the latest `.deb` package from the [Releases](https://github.com/hoaug-tran/A12PowerFix/releases) tab.
+| Model | Board ID | Identifier |
+| :--- | :--- | :--- |
+| iPhone XS Max | D331pAP | `iPhone11,6` |
+| iPhone XS | D321AP | `iPhone11,2` |
+| iPhone XR | D331AP | `iPhone11,8` |
 
-### Option 1: Sileo / Zebra / Filza
-1. Download `com.hoaug.a12powerfix_1.0.0_iphoneos-arm64e.deb` onto your iPhone.
-2. Open the `.deb` file in **Filza**, tap **Install** (or share to **Sileo** / **Zebra**).
-3. Tap **Respring / Done** when installation finishes.
-4. Reboot the iPhone once (Full Reboot: Power off and turn back on).
-5. Open your jailbreak app (Dopamine / RootHide) and tap **Jailbreak**.
+- **Firmware:** iOS 18.0 - 18.7.1+
+- **Architecture:** `iphoneos-arm64e` (RootHide Dopamine)
 
-### Option 2: Terminal / SSH
-```bash
-# Transfer the deb to the device
-scp com.hoaug.a12powerfix_1.0.0_iphoneos-arm64e.deb mobile@<IP>:/var/mobile/
+---
 
-# SSH into the device and install
-ssh mobile@<IP>
+## Installation
+
+### Via Package Manager (Filza / Sileo / Zebra)
+1. Download `com.hoaug.a12powerfix_1.0.0_iphoneos-arm64e.deb` from [Releases](https://github.com/hoaug-tran/A12PowerFix/releases).
+2. Open in Filza and tap **Install** (or import into Sileo/Zebra).
+3. Perform a full device reboot (power off and on).
+4. Re-run jailbreak in Dopamine/RootHide.
+
+### Via SSH / Terminal
+```sh
+# Copy deb to device
+scp com.hoaug.a12powerfix_1.0.0_iphoneos-arm64e.deb mobile@<DEVICE_IP>:/var/mobile/
+
+# Install and reboot
+ssh mobile@<DEVICE_IP>
 sudo dpkg -i /var/mobile/com.hoaug.a12powerfix_1.0.0_iphoneos-arm64e.deb
-
-# Reboot device once
 sudo reboot
 ```
 
 ---
 
-## 🔍 Verification
+## Verification
 
-After installation and rebooting, you can verify charging status via SSH:
-```bash
+### Charging Status
+Query `AppleSmartBattery` via IORegistry:
+```sh
 ioreg -r -c AppleSmartBattery -l | grep -E 'NotChargingReason|ChargingCurrent|Voltage|CurrentCapacity'
 ```
 
-Expected output while connected to a PD fast charger:
+Normal fast-charging values on USB-PD:
 ```text
 "NotChargingReason" = 0
 "ChargingCurrent" = 3076
 "Voltage" = 3975
 ```
-- `NotChargingReason` should be **`0`** (charging normally).
-- `ChargingCurrent` should be **`> 2000 - 3000 mA`** (Fast charging active at ~12-15W).
+- `NotChargingReason = 0` indicates inflow is active (bit 26 cleared).
+- `ChargingCurrent > 2000` indicates fast charging (>10-15W).
 
-To verify the Anti-Throttle mount:
-```bash
+### Thermal Mount
+Verify the bindfs mount is active:
+```sh
 mount | grep -i thermal
 ```
+
 Expected output:
 ```text
-/var/containers/Bundle/Application/.jbroot-.../bindfs/System/Library/ThermalMonitor on /System/Library/ThermalMonitor (bindfs, local, nosuid, read-only, nobrowse)
+/var/containers/Bundle/Application/.../bindfs/System/Library/ThermalMonitor on /System/Library/ThermalMonitor (bindfs, local, nosuid, read-only, nobrowse)
 ```
 
 ---
 
-## 🗑️ Uninstallation
+## Uninstallation
 
-If you ever wish to remove the tweak:
-```bash
+```sh
 sudo dpkg -r com.hoaug.a12powerfix
 ```
-The uninstallation script will cleanly unmount `/System/Library/ThermalMonitor` and remove the launchdaemon.
+
+The uninstaller removes the launch daemon and unmounts `/System/Library/ThermalMonitor`.
 
 ---
 
-## 📄 License & Credits
-- Authored by **hoaug** (2026).
-- Built with reverse-engineering insights from `morluto/rea` and `Battman` (Torrekie).
-- License: MIT.
+## Building
+
+```sh
+python build.py
+```
+
+Outputs package to `packages/com.hoaug.a12powerfix_1.0.0_iphoneos-arm64e.deb`.
+
+---
+
+## License
+
+MIT. See `LICENSE`.
