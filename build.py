@@ -7,23 +7,22 @@ PACKAGES_DIR = os.path.join(REPO_DIR, 'packages')
 os.makedirs(PACKAGES_DIR, exist_ok=True)
 
 control_content = """Package: com.hoaug.a12powerfix
-Name: A12 Power & Anti-Throttle Fix
-Version: 1.1.0
+Name: A12 Power & Charging Clean Fix
+Version: 2.0.0
 Architecture: iphoneos-arm64e
 Maintainer: hoaug <hoaug@duck.com>
 Author: hoaug
 Section: System
 Priority: optional
-Description: Permanent fix for 0x04000000 charging pause, locks KioskMode to 0 (immutable), resets battery health cache, and provides zero-throttle max performance with auto-bindfs.
+Description: Unified power & thermal fix for Apple A12 (XS/XS Max/XR) on iOS 18 RootHide Dopamine. Completely eliminates 77% charging stall (0x04000000), bypasses JEITA 41C thermal charge cutoff (NotChargingReason = 16), removes Kiosk 1% battery lock, permanently suppresses the yellow overheat lock screen (SBThermalEmergencyAlertItem), and unlocks 101 load index zero-throttling.
 Tag: role::hacker, purpose::extension
 """
 
 postinst_content = """#!/bin/sh
 set -e
 
-echo "[A12PowerFix] Installing A12 Power & Anti-Throttle Fix..."
+echo "[A12PowerFix] Installing v2.0.0 Unified Power & Thermal Fix..."
 
-# 1. Detect active jbroot
 JBROOT=""
 if command -v jbctl >/dev/null 2>&1; then
     JBROOT=$(jbctl | grep -o '/.*' | head -n1)
@@ -35,128 +34,34 @@ if [ -z "$JBROOT" ]; then
     JBROOT=$(find /var/containers/Bundle/Application/ -name '.jbroot*' -type d 2>/dev/null | head -n1)
 fi
 
-echo "[A12PowerFix] Using JBROOT: $JBROOT"
+echo "[A12PowerFix] Active JBROOT: $JBROOT"
 
-# 2. Setup bindfs target directory
-BINDFS_DIR="$JBROOT/bindfs/System/Library/ThermalMonitor"
-mkdir -p "$BINDFS_DIR"
-
-SRC_DIR="/var/mobile/Library/A12PowerFix/ThermalMonitor"
-if [ -d "$SRC_DIR" ]; then
-    cp "$SRC_DIR/D331pAP-Info.plist" "$BINDFS_DIR/D331pAP-Info.plist"
-    cp "$SRC_DIR/D321AP-Info.plist" "$BINDFS_DIR/D321AP-Info.plist"
-    rm -f "$BINDFS_DIR/D331AP-Info.plist"
-    ln -s D331pAP-Info.plist "$BINDFS_DIR/D331AP-Info.plist"
-    chmod 0644 "$BINDFS_DIR"/*
-    chown -R 0:0 "$BINDFS_DIR"
+ENT="$JBROOT/etc/a12powerfix/ent.plist"
+if [ ! -f "$ENT" ]; then
+    ENT="/tmp/ent.plist"
 fi
 
-# 3. Configure auto-bindfs
-if command -v mount_bindfs >/dev/null 2>&1; then
-    mount_bindfs -s --add "/System/Library/ThermalMonitor" 2>/dev/null || true
-    mount_bindfs "/System/Library/ThermalMonitor" 2>/dev/null || true
+# 1. Sign binaries with ldid
+if command -v ldid >/dev/null 2>&1; then
+    ldid -S"$ENT" "$JBROOT/usr/bin/a12chargingd" 2>/dev/null || true
+    ldid -S"$ENT" "$JBROOT/usr/lib/TweakInject/KillThermalAlert.dylib" 2>/dev/null || true
 fi
+chmod 755 "$JBROOT/usr/bin/a12chargingd" 2>/dev/null || true
+chmod 755 "$JBROOT/usr/lib/TweakInject/KillThermalAlert.dylib" 2>/dev/null || true
+chmod 644 "$JBROOT/usr/lib/TweakInject/KillThermalAlert.plist" 2>/dev/null || true
 
-# 4. Fix KioskMode & Battery Health cache in /private/var
-PREFS_DIR=""
-for P in "/rootfs/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences" "/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences"; do
-    if [ -d "$P" ]; then
-        PREFS_DIR="$P"
-        break
-    fi
-done
+# 2. Deploy ThermalMonitor plist to mnt
+mkdir -p /mnt/System/Library/ThermalMonitor 2>/dev/null || true
+cp -f "$JBROOT/mnt/System/Library/ThermalMonitor/D331pAP-Info.plist" /mnt/System/Library/ThermalMonitor/ 2>/dev/null || true
+cp -f "$JBROOT/mnt/System/Library/ThermalMonitor/D321AP-Info.plist" /mnt/System/Library/ThermalMonitor/ 2>/dev/null || true
+cd /mnt/System/Library/ThermalMonitor/ && ln -sf D331pAP-Info.plist D331AP-Info.plist 2>/dev/null || true
 
-if [ -n "$PREFS_DIR" ]; then
-    chflags nouchg "$PREFS_DIR"/*.plist 2>/dev/null || true
-    mkdir -p "$PREFS_DIR/backup"
-    cp -n "$PREFS_DIR"/*.plist "$PREFS_DIR/backup/" 2>/dev/null || true
+# 3. Reload a12chargingd daemon
+killall -9 a12chargingd 2>/dev/null || true
+launchctl unload "$JBROOT/Library/LaunchDaemons/com.hoaug.a12chargingd.plist" 2>/dev/null || true
+launchctl load -w "$JBROOT/Library/LaunchDaemons/com.hoaug.a12chargingd.plist" 2>/dev/null || "$JBROOT/usr/bin/a12chargingd" >/dev/null 2>&1 &
 
-    CUR_SERIAL="F8Y42213S5FJPKHDF"
-    if [ -f "/tmp/ioreg" ]; then
-        DETECTED=$(/tmp/ioreg -r -c AppleSmartBattery -l | grep -o '"Serial"[[:space:]]*=[[:space:]]*"[^"]*"' | head -n1 | cut -d'"' -f4)
-        if [ -n "$DETECTED" ]; then
-            CUR_SERIAL="$DETECTED"
-        fi
-    fi
-
-    cat <<EOF > "$PREFS_DIR/com.apple.batterydata.kioskmode.plist"
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Format Version</key>
-    <integer>1</integer>
-    <key>KioskModeEntries</key>
-    <integer>0</integer>
-    <key>KioskModeExits</key>
-    <integer>0</integer>
-    <key>KioskModeHighSocResidency0</key>
-    <integer>0</integer>
-    <key>KioskModeHighSocResidency1</key>
-    <integer>0</integer>
-    <key>KioskModeHighSocResidency2</key>
-    <integer>0</integer>
-    <key>KioskModeHighSocResidency3</key>
-    <integer>0</integer>
-    <key>KioskModeMode</key>
-    <integer>0</integer>
-    <key>KioskModeResidency0</key>
-    <integer>0</integer>
-    <key>KioskModeResidency1</key>
-    <integer>0</integer>
-    <key>KioskModeResidency2</key>
-    <integer>0</integer>
-    <key>KioskModeResidency3</key>
-    <integer>0</integer>
-    <key>Serial</key>
-    <string>$CUR_SERIAL</string>
-    <key>lastUpdateTs</key>
-    <real>815879610.0</real>
-</dict>
-</plist>
-EOF
-
-    cat <<EOF > "$PREFS_DIR/com.apple.thermalmonitor.agingcontroller.plist"
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>DataMigrated</key>
-    <true/>
-    <key>MitigationState</key>
-    <integer>0</integer>
-    <key>UPOCount</key>
-    <integer>0</integer>
-</dict>
-</plist>
-EOF
-
-    cat <<EOF > "$PREFS_DIR/com.apple.batteryhealthdata.plist"
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Battery Serial</key>
-    <string>$CUR_SERIAL</string>
-    <key>Battery Service Flags</key>
-    <integer>0</integer>
-    <key>Battery Service State</key>
-    <integer>0</integer>
-    <key>Maximum Capacity Percent</key>
-    <integer>100</integer>
-</dict>
-</plist>
-EOF
-
-    chmod 0644 "$PREFS_DIR"/*.plist
-    chown -R 0:0 "$PREFS_DIR"
-
-    # Make KioskMode & BatteryHealth immutable to prevent iOS daemons from re-enabling kiosk limits
-    chflags uchg "$PREFS_DIR/com.apple.batterydata.kioskmode.plist" 2>/dev/null || true
-    chflags uchg "$PREFS_DIR/com.apple.batteryhealthdata.plist" 2>/dev/null || true
-fi
-
-# 5. Disable useless background daemons that waste RAM and CPU
+# 4. Disable heavy background telemetry and intelligence daemons
 DAEMONS="
 com.apple.modelcatalogd
 com.apple.intelligenceplatformd
@@ -173,10 +78,14 @@ for d in $DAEMONS; do
     launchctl disable "system/$d" 2>/dev/null || true
 done
 
+# 5. Clean logs and reset powerd & SpringBoard
 rm -rf /private/var/mobile/Library/Logs/CrashReporter/* 2>/dev/null || true
-rm -f /private/var/preferences/SystemConfiguration/OSThermalStatus.plist 2>/dev/null || true
+killall -9 powerd 2>/dev/null || true
+if command -v sbreload >/dev/null 2>&1; then
+    sbreload 2>/dev/null || true
+fi
 
-echo "[A12PowerFix] Done! All fixes configured successfully."
+echo "[A12PowerFix] v2.0.0 installed successfully! No overheat alert, full 100% charging unlocked."
 exit 0
 """
 
@@ -184,92 +93,77 @@ prerm_content = """#!/bin/sh
 set -e
 
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
-    echo "[A12PowerFix] Removing A12 Power & Anti-Throttle Fix..."
-    if command -v mount_bindfs >/dev/null 2>&1; then
-        mount_bindfs -u "/System/Library/ThermalMonitor" 2>/dev/null || true
-        mount_bindfs -s --del "/System/Library/ThermalMonitor" 2>/dev/null || true
+    echo "[A12PowerFix] Removing A12 Power & Charging Clean Fix..."
+    killall -9 a12chargingd 2>/dev/null || true
+    launchctl unload /Library/LaunchDaemons/com.hoaug.a12chargingd.plist 2>/dev/null || true
+    rm -f /usr/lib/TweakInject/KillThermalAlert.dylib 2>/dev/null || true
+    rm -f /usr/lib/TweakInject/KillThermalAlert.plist 2>/dev/null || true
+    if command -v sbreload >/dev/null 2>&1; then
+        sbreload 2>/dev/null || true
     fi
-
-    for P in "/rootfs/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences" "/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences"; do
-        if [ -d "$P" ]; then
-            chflags nouchg "$P"/*.plist 2>/dev/null || true
-        fi
-    done
 fi
 exit 0
 """
 
-wrapper_content = """#!/bin/sh
-exec /usr/sbin/mount_bindfs "$@"
-"""
+with open(os.path.join(SRC_DIR, 'a12chargingd'), 'rb') as f:
+    a12chargingd_bin = f.read()
 
-launchdaemon_content = """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.nan.auto-bindfs</string>
-    <key>ProcessType</key>
-    <string>Interactive</string>
-    <key>POSIXSpawnType</key>
-    <string>Interactive</string>
-    <key>Program</key>
-    <string>/bin/sh</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/sh</string>
-        <string>/usr/libexec/mount_bindfs/auto-bindfs-wrapper</string>
-        <string>--auto</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-</dict>
-</plist>
-"""
+with open(os.path.join(SRC_DIR, 'com.hoaug.a12chargingd.plist'), 'rb') as f:
+    a12chargingd_plist = f.read()
 
-with open(os.path.join(SRC_DIR, 'D331pAP-Info-Patched.plist'), 'rb') as f:
+with open(os.path.join(SRC_DIR, 'KillThermalAlert.dylib'), 'rb') as f:
+    kill_alert_dylib = f.read()
+
+with open(os.path.join(SRC_DIR, 'KillThermalAlert.plist'), 'rb') as f:
+    kill_alert_plist = f.read()
+
+with open(os.path.join(SRC_DIR, 'D331pAP-Info.plist'), 'rb') as f:
     d331p_bytes = f.read()
 
-with open(os.path.join(SRC_DIR, 'D321AP-Info-Patched.plist'), 'rb') as f:
+with open(os.path.join(SRC_DIR, 'D321AP-Info.plist'), 'rb') as f:
     d321_bytes = f.read()
 
-with open(os.path.join(SRC_DIR, 'mount_bindfs'), 'rb') as f:
-    mount_bindfs_bytes = f.read()
+with open(os.path.join(SRC_DIR, 'ent.plist'), 'rb') as f:
+    ent_bytes = f.read()
 
 control_files = [
     ('./control', control_content.strip().encode('utf-8') + b'\n', 0o644),
     ('./postinst', postinst_content.strip().encode('utf-8') + b'\n', 0o755),
-    ('./prerm', prerm_content.strip().encode('utf-8') + b'\n', 0o755),
+    ('./prerm', prerm_content.strip().encode('utf-8') + b'\n', 0o755)
 ]
 
 data_files = [
     # Directories
-    {'path': './var', 'type': tarfile.DIRTYPE, 'mode': 0o755},
-    {'path': './var/mobile', 'type': tarfile.DIRTYPE, 'mode': 0o755},
-    {'path': './var/mobile/Library', 'type': tarfile.DIRTYPE, 'mode': 0o755},
-    {'path': './var/mobile/Library/A12PowerFix', 'type': tarfile.DIRTYPE, 'mode': 0o755},
-    {'path': './var/mobile/Library/A12PowerFix/ThermalMonitor', 'type': tarfile.DIRTYPE, 'mode': 0o755},
     {'path': './usr', 'type': tarfile.DIRTYPE, 'mode': 0o755},
-    {'path': './usr/sbin', 'type': tarfile.DIRTYPE, 'mode': 0o755},
-    {'path': './usr/libexec', 'type': tarfile.DIRTYPE, 'mode': 0o755},
-    {'path': './usr/libexec/mount_bindfs', 'type': tarfile.DIRTYPE, 'mode': 0o755},
+    {'path': './usr/bin', 'type': tarfile.DIRTYPE, 'mode': 0o755},
+    {'path': './usr/lib', 'type': tarfile.DIRTYPE, 'mode': 0o755},
+    {'path': './usr/lib/TweakInject', 'type': tarfile.DIRTYPE, 'mode': 0o755},
     {'path': './Library', 'type': tarfile.DIRTYPE, 'mode': 0o755},
     {'path': './Library/LaunchDaemons', 'type': tarfile.DIRTYPE, 'mode': 0o755},
-    
-    # Plists
-    {'path': './var/mobile/Library/A12PowerFix/ThermalMonitor/D331pAP-Info.plist', 'content': d331p_bytes, 'mode': 0o644},
-    {'path': './var/mobile/Library/A12PowerFix/ThermalMonitor/D321AP-Info.plist', 'content': d321_bytes, 'mode': 0o644},
-    {'path': './var/mobile/Library/A12PowerFix/ThermalMonitor/D331AP-Info.plist', 'type': tarfile.SYMTYPE, 'linkname': 'D331pAP-Info.plist', 'mode': 0o777},
+    {'path': './etc', 'type': tarfile.DIRTYPE, 'mode': 0o755},
+    {'path': './etc/a12powerfix', 'type': tarfile.DIRTYPE, 'mode': 0o755},
+    {'path': './mnt', 'type': tarfile.DIRTYPE, 'mode': 0o755},
+    {'path': './mnt/System', 'type': tarfile.DIRTYPE, 'mode': 0o755},
+    {'path': './mnt/System/Library', 'type': tarfile.DIRTYPE, 'mode': 0o755},
+    {'path': './mnt/System/Library/ThermalMonitor', 'type': tarfile.DIRTYPE, 'mode': 0o755},
 
-    # Binaries and Daemons
-    {'path': './usr/sbin/mount_bindfs', 'content': mount_bindfs_bytes, 'mode': 0o755},
-    {'path': './usr/libexec/mount_bindfs/auto-bindfs-wrapper', 'content': wrapper_content.strip().encode('utf-8') + b'\n', 'mode': 0o755},
-    {'path': './Library/LaunchDaemons/com.nan.auto-bindfs.plist', 'content': launchdaemon_content.strip().encode('utf-8') + b'\n', 'mode': 0o644},
+    # Daemon
+    {'path': './usr/bin/a12chargingd', 'content': a12chargingd_bin, 'mode': 0o755},
+    {'path': './Library/LaunchDaemons/com.hoaug.a12chargingd.plist', 'content': a12chargingd_plist, 'mode': 0o644},
+
+    # SpringBoard Tweak (Kill Yellow Alert)
+    {'path': './usr/lib/TweakInject/KillThermalAlert.dylib', 'content': kill_alert_dylib, 'mode': 0o755},
+    {'path': './usr/lib/TweakInject/KillThermalAlert.plist', 'content': kill_alert_plist, 'mode': 0o644},
+
+    # Thermal Profiles (101 Zero Throttling, 99C Trap)
+    {'path': './mnt/System/Library/ThermalMonitor/D331pAP-Info.plist', 'content': d331p_bytes, 'mode': 0o644},
+    {'path': './mnt/System/Library/ThermalMonitor/D321AP-Info.plist', 'content': d321_bytes, 'mode': 0o644},
+    {'path': './mnt/System/Library/ThermalMonitor/D331AP-Info.plist', 'type': tarfile.SYMTYPE, 'linkname': 'D331pAP-Info.plist', 'mode': 0o777},
+
+    # Entitlements
+    {'path': './etc/a12powerfix/ent.plist', 'content': ent_bytes, 'mode': 0o644},
 ]
 
-out_deb = os.path.join(PACKAGES_DIR, 'com.hoaug.a12powerfix_1.1.0_iphoneos-arm64e.deb')
+out_deb = os.path.join(PACKAGES_DIR, 'com.hoaug.a12powerfix_2.0.0_iphoneos-arm64e.deb')
 create_deb(out_deb, control_files, data_files)
 print(f"[Build] Successfully created {out_deb}")
-
